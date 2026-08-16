@@ -1,22 +1,24 @@
 # Docker setup
 
-Containerised form of the **official LingBot-VA install instructions** (upstream
-`Robbyant/lingbot-va` README) — nothing else. Two images, matching the
-two-environment split that README requires:
+**One image**, `lingbotva-rmbench`, built from `Dockerfile`. It is the
+containerised form of the official upstream `Robbyant/lingbot-va` README —
+"Quick Start > Installation" plus "Post-Training > Additional Dependencies" —
+and it runs post-training and the inference server.
 
-| Image | Dockerfile | Follows | Runs |
-|---|---|---|---|
-| `lingbotva-rmbench` | `Dockerfile` | README "Quick Start > Installation" + "Post-Training > Additional Dependencies" | post-training + inference server |
-| `lingbotva-rmbench-robotwin` | `Dockerfile.robotwin` | README "Evaluation on RoboTwin-2.0 > Preparing the Environment" (steps 1–5) | RoboTwin 2.0 evaluation client |
+RoboTwin evaluation runs in the *same* container after one run-time install
+step (below). It is not baked into the image because it has its own pins, it is
+only needed when you want simulator success rates, and it needs a RoboTwin
+checkout that is bind-mounted anyway.
 
-**No deviations.** Every `pip` command in both files is the README's, verbatim
-and in order — no added package, no added pin, no reordering. Only system
-(`apt`) packages are supplied on top, because the README assumes a host that
-already has an interpreter, a compiler and the shared libraries its pip packages
-link against.
+**No deviations.** Every `pip` command in the Dockerfile is the README's,
+verbatim and in order — no added package, no added pin, no reordering. Only
+system (`apt`) packages sit on top, because the README assumes a host that
+already has an interpreter, a compiler, and the shared libraries its pip
+packages link against.
 
-Both are **environment-only**: the repo, checkpoints, datasets and the RoboTwin
-checkout are bind-mounted at runtime, so code edits never require a rebuild.
+The image is **environment-only**: the repo, checkpoints, datasets and the
+RoboTwin checkout are bind-mounted at run time, so code edits never require a
+rebuild.
 
 ### One thing the README leaves broken
 
@@ -37,11 +39,10 @@ Setting `enable_wandb=False` in the train config is not sufficient on its own �
 ## Build
 
 ```bash
-docker build -f docker/Dockerfile          -t lingbotva-rmbench:latest       docker/
-docker build -f docker/Dockerfile.robotwin -t lingbotva-rmbench-robotwin:latest docker/
+docker build -f docker/Dockerfile -t lingbotva-rmbench:latest docker/
 ```
 
-flash-attn / pytorch3d compile from source if no wheel matches; pass
+flash-attn compiles from source if no wheel matches; pass
 `--build-arg MAX_JOBS=4` on small-RAM hosts.
 
 All commands below are run from the **repo root** (`lingbot-va-rmbench/`), which
@@ -66,7 +67,7 @@ NGPU=8 CONFIG_NAME='robotwin_train' bash script/run_va_posttrain.sh --save-root 
   placeholders); with no wandb account set `enable_wandb=False` in the train config.
 - Config edits (dataset_path, checkpoint path) are on the host — the repo is a mount.
 
-## Run: inference server (same image)
+## Run: inference server
 
 ```bash
 docker run --gpus all -it --network host \
@@ -78,25 +79,63 @@ docker run --gpus all -it --network host \
 
 `--network host` lets the client reach the server on `localhost:29536`.
 
-## Run: RoboTwin evaluation client
+## RoboTwin evaluation: one-time setup inside the container
 
-Server and client must share the machine (README requirement); with host
-networking two containers count as sharing.
+Start the container with the RoboTwin checkout mounted and Vulkan enabled:
 
 ```bash
 docker run --gpus all -it --network host \
     -e NVIDIA_DRIVER_CAPABILITIES=all \
     -v "$PWD":/workspace/lingbot-va \
     -v /path/to/RoboTwin:/workspace/RoboTwin \
-    lingbotva-rmbench-robotwin:latest
-# inside:
+    lingbotva-rmbench:latest
+```
+
+Then, **inside** it, run README "Evaluation on RoboTwin-2.0 > Preparing the
+Environment" steps 3–5 (step 1's vulkan packages are already in the image;
+step 2's clone is the mount above):
+
+```bash
+pip install \
+    transforms3d==0.4.2 sapien==3.0.0b1 scipy==1.10.1 mplib==0.2.1 \
+    gymnasium==0.29.1 trimesh==4.4.3 open3d==0.18.0 imageio==2.34.2 \
+    pydantic zarr openai huggingface_hub==0.36.2 h5py \
+    azure==4.0.0 azure-ai-inference "pyglet<2" wandb moviepy imageio \
+    termcolor av matplotlib ffmpeg
+pip install "git+https://github.com/facebookresearch/pytorch3d.git@stable" --no-build-isolation
+```
+
+Assets (README step 6) are downloaded once into the mounted checkout:
+
+```bash
+cd /workspace/RoboTwin && bash script/_download_assets.sh
+```
+
+Then launch server and client from two shells in the same container:
+
+```bash
+bash evaluation/robotwin/launch_server.sh
 ROBOTWIN_ROOT=/workspace/RoboTwin bash evaluation/robotwin/launch_client.sh results/ adjust_bottle
 ```
+
+### Two things to know
+
+- **`scipy` gets downgraded to 1.10.1.** The model env installs `scipy`
+  unpinned; RoboTwin pins 1.10.1, and pip will move it. Both users of scipy in
+  this repo — `wan_va/dataset/lerobot_latent_dataset.py:15` and
+  `evaluation/robotwin/eval_polict_client_openpi.py:39` — only want
+  `scipy.spatial.transform.Rotation`, which 1.10.1 has, so this is expected to be
+  harmless. `numpy` follows it down to 1.26.x, which is what upstream's own
+  `requirements.txt` pins anyway. If it ever does bite, put the RoboTwin stack in
+  its own venv instead:
+  `python -m venv --system-site-packages /workspace/rt-venv && /workspace/rt-venv/bin/pip install ...`
+- **Container-local installs are lost when the container is removed.** Either
+  keep the container around (`docker start -ai <name>` instead of `docker run`),
+  or `docker commit` it once the RoboTwin stack is in, or put the venv on a
+  mounted volume as above.
 
 - `NVIDIA_DRIVER_CAPABILITIES=all` makes the NVIDIA runtime inject the Vulkan
   ICD, which SAPIEN's headless renderer needs. Verify with `vulkaninfo --summary`
   inside the container before debugging SAPIEN itself.
-- The RoboTwin checkout (`git checkout 2eeec322`) and its assets
-  (`bash script/_download_assets.sh`) live on the host and are mounted in.
 - `ROBOTWIN_ROOT` is read by `evaluation/robotwin/eval_polict_client_openpi.py`
   (defaults to `/workspace/RoboTwin`).

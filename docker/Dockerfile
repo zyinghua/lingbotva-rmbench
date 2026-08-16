@@ -1,8 +1,15 @@
-# LingBot-VA model environment (post-training + inference server).
+# LingBot-VA environment: post-training, inference server, and -- after the
+# one run-time step in docker/README.md -- RoboTwin evaluation as well.
 #
 # STRICT: every pip command below is the official upstream README, verbatim and
 # in order -- README "Quick Start > Installation" and "Post-Training >
 # Additional Dependencies". No added package, no added pin, no reordering.
+#
+# The RoboTwin simulator stack is deliberately NOT built in. It is a different
+# concern with its own pins (scipy==1.10.1 against this env's unpinned scipy),
+# it is only needed when you want simulator success rates, and it wants a
+# RoboTwin checkout that is bind-mounted anyway. Install it inside the running
+# container instead -- one command, documented in docker/README.md.
 #
 #     docker build -f docker/Dockerfile -t lingbotva-rmbench:latest docker/
 #
@@ -19,11 +26,16 @@ ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1
 # System packages only -- the README assumes a host that already has these.
 # python-is-python3: the launch scripts invoke bare `python`.
 # build-essential/ninja: flash-attn compiles from source.
-# libgl1/libglib: shared libraries opencv-python links against.
+# libgl1/libglib/libx11/libxext: shared libraries opencv and SAPIEN link against.
+#
+# The vulkan trio is README "Evaluation on RoboTwin-2.0" step 1, baked in here
+# so that adding the RoboTwin python stack at run time (see docker/README.md)
+# needs no root apt inside a live container. They are inert if you only train.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.10 python3.10-dev python3-pip python-is-python3 \
         git ca-certificates build-essential ninja-build \
-        ffmpeg libgl1 libglib2.0-0 \
+        ffmpeg libgl1 libglib2.0-0 libx11-6 libxext6 \
+        libvulkan1 mesa-vulkan-drivers vulkan-tools \
     && rm -rf /var/lib/apt/lists/*
 
 # --- README > Quick Start > Installation ------------------------------------
