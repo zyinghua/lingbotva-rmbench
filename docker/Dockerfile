@@ -23,10 +23,17 @@ FROM nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1
 
+# SAPIEN headless rendering needs the NVIDIA graphics capability in addition
+# to the CUDA image's default compute/utility capabilities.  `--gpus all` is
+# still required when the container is created (see docker/README.md).
+ENV NVIDIA_DRIVER_CAPABILITIES=all
+
 # System packages only -- the README assumes a host that already has these.
 # python-is-python3: the launch scripts invoke bare `python`.
 # build-essential/ninja: flash-attn compiles from source.
 # libgl1/libglib/libx11/libxext: shared libraries opencv and SAPIEN link against.
+# libegl1/libegl-mesa0: EGL loader + vendor directory required by SAPIEN 3.0.0b1.
+# unzip: RoboTwin's asset downloader extracts its three downloaded archives.
 #
 # The vulkan trio is README "Evaluation on RoboTwin-2.0" step 1, baked in here
 # so that adding the RoboTwin python stack at run time (see docker/README.md)
@@ -35,6 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.10 python3.10-dev python3-pip python-is-python3 \
         git ca-certificates build-essential ninja-build \
         ffmpeg libgl1 libglib2.0-0 libx11-6 libxext6 \
+        libegl1 libegl-mesa0 unzip \
         libvulkan1 mesa-vulkan-drivers vulkan-tools \
     && rm -rf /var/lib/apt/lists/*
 
@@ -71,5 +79,5 @@ RUN pip install lerobot==0.3.3 scipy wandb --no-deps
 # wandb half of the problem (train.py imports wandb regardless of the flag).
 # ---------------------------------------------------------------------------
 
-WORKDIR /workspace/lingbot-va
+WORKDIR /workspace/lingbotva-rmbench
 CMD ["/bin/bash"]
