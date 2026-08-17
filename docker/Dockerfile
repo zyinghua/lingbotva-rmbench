@@ -79,5 +79,5 @@ RUN pip install lerobot==0.3.3 scipy wandb --no-deps
 # wandb half of the problem (train.py imports wandb regardless of the flag).
 # ---------------------------------------------------------------------------
 
-WORKDIR /workspace/lingbotva-rmbench
+WORKDIR /workspace
 CMD ["/bin/bash"]
