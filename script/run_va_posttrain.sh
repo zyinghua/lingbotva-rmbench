@@ -2,7 +2,7 @@
 
 set -x
 
-umask 007
+umask 022
  
 NGPU=${NGPU:-"8"}
 MASTER_PORT=${MASTER_PORT:-"29501"}
