@@ -43,22 +43,20 @@ python tools/rmbench/validate_dataset.py \
     --expect-episodes 50
 ```
 
-## Then: configs
+## Task configs
 
-Copy `wan_va/configs/va_robotwin_cfg.py` + `va_robotwin_train_cfg.py` to
-`va_rmbench_<task>_cfg.py` / `..._train_cfg.py` and change:
+`put_back_block` is registered as:
 
-- `norm_stat` — paste the block step 2 printed (**the** silent-failure field:
-  wrong quantiles raise nothing, the policy just mis-scales every motion)
-- `dataset_path` / `empty_emb_path` (train cfg)
-- `save_root` — per-task; checkpoints are named by step only and collide otherwise
-- `num_steps` / `save_interval` — scale to ~50 episodes, not 50k steps
-- register both in `wan_va/configs/__init__.py` (`VA_CONFIGS`)
+- `rmbench_put_back_block` for serving/evaluation
+- `rmbench_put_back_block_train` for post-training
 
-Everything else (cameras, T-shape, `action_per_frame=16`, `attn_window`,
-snr shifts) is inherited unchanged: same embodiment, same 50 fps platform,
-`env_type='robotwin_tshape'` is what makes the loader, latent tiling and eval
-client work with zero code changes.
+The shared task config inherits RoboTwin's cameras, T-shape,
+`action_per_frame=16`, attention window and SNR shifts, then replaces the model
+default with `ckpts/lingbot-va-base` and the task-specific normalization computed
+from 17,562 rows. The training config points only at
+`/datasets/RMBench-data/lingbotva-rmbench/put_back_block` and defaults to a
+separate 3,000-step output directory so checkpoints cannot collide with the
+RoboTwin test run.
 
 ## Invariants worth knowing
 

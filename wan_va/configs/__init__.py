@@ -5,6 +5,8 @@ from .va_franka_i2va import va_franka_i2va_cfg
 from .va_robotwin_i2va import va_robotwin_i2va_cfg
 from .va_robotwin_train_cfg import va_robotwin_train_cfg
 from .va_robotwin_adjust_bottle_train_cfg import va_robotwin_adjust_bottle_train_cfg
+from .va_rmbench_put_back_block_cfg import va_rmbench_put_back_block_cfg
+from .va_rmbench_put_back_block_train_cfg import va_rmbench_put_back_block_train_cfg
 from .va_demo_train_cfg import va_demo_train_cfg
 from .va_demo_cfg import va_demo_cfg
 from .va_demo_i2va import va_demo_i2va_cfg
@@ -19,6 +21,8 @@ VA_CONFIGS = {
     'franka_i2av': va_franka_i2va_cfg,
     'robotwin_train': va_robotwin_train_cfg,
     'robotwin_adjust_bottle_train': va_robotwin_adjust_bottle_train_cfg,
+    'rmbench_put_back_block': va_rmbench_put_back_block_cfg,
+    'rmbench_put_back_block_train': va_rmbench_put_back_block_train_cfg,
     'demo': va_demo_cfg,
     'demo_train': va_demo_train_cfg,
     'demo_i2av': va_demo_i2va_cfg,
