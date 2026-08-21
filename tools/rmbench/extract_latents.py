@@ -39,8 +39,9 @@ import os
 import sys
 from pathlib import Path
 
-import cv2
+import av
 import numpy as np
+import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
 
@@ -54,6 +55,144 @@ from modules.utils import (                                            # noqa: E
 CAM_KEYS = ["observation.images.cam_high",
             "observation.images.cam_left_wrist",
             "observation.images.cam_right_wrist"]
+AV1_CODEC_ID = av.codec.Codec("av1", "r").id
+
+
+def plan_frame_ids(start, end, stride):
+    """Plan the largest causal-VAE-compatible 4k+1 subsequence."""
+    if not 0 <= start < end:
+        raise ValueError(f"invalid action segment [{start},{end})")
+    frame_ids = list(range(start, end, stride))
+    if not frame_ids:
+        raise ValueError(f"action segment [{start},{end}) yields no sampled frames")
+    keep = len(frame_ids) - ((len(frame_ids) - 1) % 4)
+    return frame_ids[:keep]
+
+
+def validate_extraction_plan(dataset, info, episodes, stride):
+    """Fail before model loading if metadata cannot satisfy the training loader."""
+    if info.get("fps") != 50:
+        raise ValueError(f"dataset fps is {info.get('fps')}, expected RoboTwin's 50")
+    if info.get("total_episodes") != len(episodes):
+        raise ValueError(
+            f"info.total_episodes={info.get('total_episodes')}, but metadata has "
+            f"{len(episodes)} episodes"
+        )
+    action_feature = info.get("features", {}).get("action", {})
+    if (
+        action_feature.get("dtype") != "float32"
+        or action_feature.get("shape") != [16]
+    ):
+        raise ValueError(
+            f"dataset action feature is {action_feature}; expected EEF float32[16]"
+        )
+    for camera in CAM_KEYS:
+        feature = info.get("features", {}).get(camera, {})
+        feature_info = feature.get("info", {})
+        if (
+            feature.get("dtype") != "video"
+            or feature.get("shape") != [3, 480, 640]
+            or feature_info.get("video.codec") != "av1"
+            or feature_info.get("video.pix_fmt") != "yuv420p"
+            or feature_info.get("video.fps") != 50
+        ):
+            raise ValueError(f"{camera}: incompatible video metadata {feature}")
+
+    planned_segments = 0
+    for episode in episodes:
+        episode_index = episode["episode_index"]
+        episode_length = episode["length"]
+        parquet_path = (
+            dataset / "data" / "chunk-000"
+            / f"episode_{episode_index:06d}.parquet"
+        )
+        if not parquet_path.is_file():
+            raise FileNotFoundError(f"missing {parquet_path}")
+        action_table = pq.read_table(parquet_path, columns=["action"])
+        parquet_rows = action_table.num_rows
+        if parquet_rows != episode_length:
+            raise ValueError(
+                f"{parquet_path}: {parquet_rows} rows, metadata says {episode_length}"
+            )
+        action_type = action_table["action"].type
+        if getattr(action_type, "list_size", None) != 16:
+            raise ValueError(
+                f"{parquet_path}: action column type is {action_type}, expected "
+                "fixed-size list[16]"
+            )
+
+        action_configs = episode.get("action_config")
+        if not isinstance(action_configs, list) or not action_configs:
+            raise ValueError(f"episode {episode_index}: missing action_config")
+        for segment in action_configs:
+            start, end = segment["start_frame"], segment["end_frame"]
+            if not 0 <= start < end <= episode_length:
+                raise ValueError(
+                    f"episode {episode_index}: invalid segment [{start},{end}) "
+                    f"for length {episode_length}"
+                )
+            text = segment.get("action_text")
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError(
+                    f"episode {episode_index} [{start},{end}): empty action_text"
+                )
+
+            frame_ids = plan_frame_ids(start, end, stride)
+            if len(frame_ids) < 5:
+                raise ValueError(
+                    f"episode {episode_index} [{start},{end}) has only "
+                    f"{len(frame_ids)} aligned sampled frames"
+                )
+
+            latent_frames = 1 + (len(frame_ids) - 1) // 4
+            required_actions = latent_frames * stride * 4
+            # _action_post_process drops rows before frame_ids[0], prepends one
+            # stride*4 zero-action block, then requires exactly this many rows.
+            available_actions = stride * 4 + end - frame_ids[0]
+            if available_actions < required_actions:
+                raise ValueError(
+                    f"episode {episode_index} [{start},{end}): loader needs "
+                    f"{required_actions} action rows after padding, but only "
+                    f"{available_actions} are available"
+                )
+            planned_segments += 1
+
+        for camera in CAM_KEYS:
+            video_path = (
+                dataset / "videos" / "chunk-000" / camera
+                / f"episode_{episode_index:06d}.mp4"
+            )
+            if not video_path.is_file():
+                raise FileNotFoundError(f"missing {video_path}")
+            with av.open(str(video_path), "r") as container:
+                try:
+                    stream = container.streams.video[0]
+                except IndexError as error:
+                    raise ValueError(f"{video_path}: no video stream") from error
+                codec_context = stream.codec_context
+                codec = codec_context.codec
+                properties = {
+                    "codec_id": codec.id,
+                    "codec_name": codec.name,
+                    "pix_fmt": codec_context.pix_fmt,
+                    "fps": float(stream.average_rate),
+                    "height": codec_context.height,
+                    "width": codec_context.width,
+                }
+            expected = {
+                "codec_id": AV1_CODEC_ID,
+                "pix_fmt": "yuv420p",
+                "fps": 50.0,
+                "height": 480,
+                "width": 640,
+            }
+            comparable = {key: properties[key] for key in expected}
+            if comparable != expected:
+                raise ValueError(
+                    f"{video_path}: stream properties {properties}, expected {expected}"
+                )
+
+    return planned_segments
 
 
 def encode_text(tokenizer, text_encoder, text, device):
@@ -71,20 +210,26 @@ def encode_text(tokenizer, text_encoder, text, device):
 
 
 def read_video_frames(path, frame_ids):
-    cap = cv2.VideoCapture(str(path))
-    frames, want = [], set(frame_ids)
-    idx = 0
-    while True:
-        ok, img = cap.read()
-        if not ok:
-            break
-        if idx in want:
-            frames.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        idx += 1
-    cap.release()
-    if len(frames) != len(frame_ids):
-        raise RuntimeError(f"{path}: read {len(frames)} frames, wanted {len(frame_ids)}")
-    return np.stack(frames)                                            # (T, H, W, 3) uint8
+    """Decode selected RGB frames with PyAV, as LeRobot does.
+
+    The official RoboTwin videos are AV1. The OpenCV build in the target image
+    cannot decode them reliably, while PyAV uses the available libdav1d stack.
+    """
+    wanted = set(frame_ids)
+    found = {}
+    last_wanted = max(wanted)
+    with av.open(str(path), "r") as container:
+        for idx, frame in enumerate(container.decode(video=0)):
+            if idx in wanted:
+                found[idx] = frame.to_ndarray(format="rgb24")
+            if idx >= last_wanted:
+                break
+    missing = [idx for idx in frame_ids if idx not in found]
+    if missing:
+        raise RuntimeError(
+            f"{path}: missing {len(missing)} requested frames; first missing={missing[0]}"
+        )
+    return np.stack([found[idx] for idx in frame_ids])                  # (T,H,W,3) uint8
 
 
 @torch.inference_mode()
@@ -184,7 +329,14 @@ def main():
         raise SystemExit("--height and --width must both be divisible by the Wan VAE factor 16")
     info = json.loads((ds / "meta" / "info.json").read_text())
     ori_fps = info["fps"]
-    episodes = [json.loads(l) for l in open(ds / "meta" / "episodes.jsonl")]
+    with (ds / "meta" / "episodes.jsonl").open(encoding="utf-8") as handle:
+        episodes = [json.loads(line) for line in handle if line.strip()]
+    planned_segments = validate_extraction_plan(ds, info, episodes, args.stride)
+    print(
+        f"[latents] preflight passed: {len(episodes)} episodes / "
+        f"{planned_segments} segments / {len(CAM_KEYS) * planned_segments} outputs",
+        flush=True,
+    )
 
     # Encode every unique prompt once, then release UMT5 before loading the VAE.
     # This lowers peak VRAM and avoids repeating the same task prompt 50 times.
@@ -193,7 +345,11 @@ def main():
         for episode in episodes
         for segment in episode["action_config"]
     })
-    print(f"[latents] loading text stack from {args.model} ({len(texts)} unique prompt(s))")
+    print(
+        f"[latents] loading text stack from {args.model} "
+        f"({len(texts)} unique prompt(s))",
+        flush=True,
+    )
     tokenizer = load_tokenizer(os.path.join(args.model, "tokenizer"))
     text_encoder = load_text_encoder(os.path.join(args.model, "text_encoder"),
                                      torch_dtype=dtype, torch_device=device)
@@ -204,7 +360,9 @@ def main():
     }
 
     if args.write_empty_emb:
-        torch.save(encode_text(tokenizer, text_encoder, "", device), ds / "empty_emb.pt")
+        save_atomic(
+            encode_text(tokenizer, text_encoder, "", device), ds / "empty_emb.pt"
+        )
         print(f"[latents] wrote {ds / 'empty_emb.pt'}")
 
     del text_encoder, tokenizer
@@ -212,7 +370,7 @@ def main():
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    print(f"[latents] loading VAE from {args.model}")
+    print(f"[latents] loading VAE from {args.model}", flush=True)
     vae = load_vae(os.path.join(args.model, "vae"), torch_dtype=dtype, torch_device=device)
     vae.eval()
 
@@ -220,17 +378,11 @@ def main():
         (ds / "latents" / "chunk-000" / cam).mkdir(parents=True, exist_ok=True)
 
     for ep in episodes:
-        idx, T = ep["episode_index"], ep["length"]
+        idx = ep["episode_index"]
         for seg in ep["action_config"]:
             s, e, text = seg["start_frame"], seg["end_frame"], seg["action_text"]
-            frame_ids = list(range(s, e, args.stride))
+            frame_ids = plan_frame_ids(s, e, args.stride)
             n = len(frame_ids)
-            n = n - ((n - 1) % 4)                                       # largest 4k+1
-            frame_ids = frame_ids[:n]
-            if len(frame_ids) < 5:
-                raise ValueError(
-                    f"episode {idx} [{s},{e}) has only {len(frame_ids)} aligned sampled frames"
-                )
             latent_T = 1 + (n - 1) // 4
 
             text_emb = text_cache[text]

@@ -47,6 +47,7 @@ import argparse
 import json
 from pathlib import Path
 
+import av
 import cv2
 import h5py
 import numpy as np
@@ -58,6 +59,12 @@ CAM_MAP = {
     "observation.images.cam_left_wrist": "left_camera",
     "observation.images.cam_right_wrist": "right_camera",
 }
+VIDEO_HEIGHT = 480
+VIDEO_WIDTH = 640
+VIDEO_CODEC = "libsvtav1"
+VIDEO_PIX_FMT = "yuv420p"
+VIDEO_OPTIONS = {"g": "2", "crf": "30"}
+AV1_CODEC_ID = av.codec.Codec("av1", "r").id
 ACTION_NAMES = (
     [f"left_{c}" for c in ("x", "y", "z", "q1", "q2", "q3", "q4")] + ["left_gripper"]
     + [f"right_{c}" for c in ("x", "y", "z", "q1", "q2", "q3", "q4")] + ["right_gripper"]
@@ -119,7 +126,9 @@ def feat_stats(arr):
 def img_stats(frames):
     """Per-channel stats over a subsample of decoded frames, values in [0,1], shape [3,1,1]."""
     a = np.stack(frames).astype(np.float64) / 255.0          # (n, H, W, 3)
-    per = lambda f: [[[float(v)]] for v in f(a, axis=(0, 1, 2))]
+    def per(function):
+        return [[[float(value)]] for value in function(a, axis=(0, 1, 2))]
+
     return {"min": per(np.min), "max": per(np.max), "mean": per(np.mean),
             "std": per(np.std), "count": [len(frames)]}
 
@@ -138,6 +147,60 @@ def downsample_stat_image(image, target_size=150, max_size_threshold=300):
         return image
     factor = int(width / target_size) if width > height else int(height / target_size)
     return image[::factor, ::factor]
+
+
+def encode_av1_video(video_path, rgb_frames, fps):
+    """Encode RGB frames with LeRobot v0.3.3's default AV1 settings.
+
+    LeRobot's reference path writes RGB PNGs and then calls PyAV with
+    libsvtav1/yuv420p, GOP 2 and CRF 30. Feeding the same RGB arrays directly
+    to PyAV is equivalent and avoids a temporary image directory.
+    """
+    tmp_path = video_path.with_name(f"{video_path.stem}.tmp{video_path.suffix}")
+    with av.open(str(tmp_path), "w") as output:
+        stream = output.add_stream(
+            VIDEO_CODEC,
+            fps,
+            options=VIDEO_OPTIONS,
+        )
+        stream.pix_fmt = VIDEO_PIX_FMT
+        stream.width = VIDEO_WIDTH
+        stream.height = VIDEO_HEIGHT
+
+        for rgb in rgb_frames:
+            frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
+            for packet in stream.encode(frame):
+                output.mux(packet)
+        for packet in stream.encode():
+            output.mux(packet)
+
+    if not tmp_path.is_file() or tmp_path.stat().st_size == 0:
+        raise RuntimeError(f"AV1 encoder produced no data at {tmp_path}")
+    tmp_path.replace(video_path)
+
+
+def inspect_video(video_path):
+    """Return decoded stream properties and frame count using LeRobot's PyAV stack."""
+    with av.open(str(video_path), "r") as container:
+        stream = container.streams.video[0]
+        codec_context = stream.codec_context
+        codec = codec_context.codec
+        properties = {
+            "codec_id": codec.id,
+            "codec_name": codec.name,
+            "pix_fmt": codec_context.pix_fmt,
+            "fps": float(stream.average_rate),
+            "height": codec_context.height,
+            "width": codec_context.width,
+        }
+        keyframes = []
+        frame_count = 0
+        for frame_count, frame in enumerate(container.decode(video=0), start=1):
+            if frame.key_frame:
+                keyframes.append(frame_count - 1)
+        properties["frames"] = frame_count
+        properties["keyframes"] = keyframes
+    return properties
 
 
 def main():
@@ -170,9 +233,17 @@ def main():
         eps = eps[: args.limit]
     if not eps:
         raise SystemExit(f"no episodes under {src}/data")
-    if (out / "meta" / "info.json").exists() and not args.overwrite:
+    known_output_files = (
+        list((out / "meta").glob("*"))
+        + list((out / "data").rglob("*.parquet"))
+        + list((out / "videos").rglob("*.mp4"))
+        + list((out / "latents").rglob("*.pth"))
+        + [path for path in (out / "empty_emb.pt", out / "norm_stat.json") if path.exists()]
+    )
+    if known_output_files and not args.overwrite:
         raise SystemExit(
-            f"{out} already contains a dataset; pass --overwrite to replace its known files"
+            f"{out} already contains dataset files; pass --overwrite to replace "
+            "its known export files, or use a fresh --out directory"
         )
     if args.overwrite:
         expected = {f"episode_{i:06d}" for i in range(len(eps))}
@@ -185,14 +256,19 @@ def main():
                 p for p in (out / "videos" / "chunk-000" / cam).glob("episode_*.mp4")
                 if p.stem not in expected
             )
-        stale_latents = list((out / "latents").rglob("*.pth"))
-        if stale or stale_latents:
-            examples = stale[:3] + stale_latents[:3]
+        stale_derived = list((out / "latents").rglob("*.pth"))
+        if (out / "norm_stat.json").exists():
+            stale_derived.append(out / "norm_stat.json")
+        if stale or stale_derived:
+            examples = stale[:3] + stale_derived[:3]
             raise SystemExit(
-                "refusing to mix a new export with stale episode/latent files. "
+                "refusing to mix a new export with stale episode or derived files. "
                 f"Use a fresh --out directory. Examples: {examples}"
             )
-    print(f"[raw2lerobot] {args.task}: {len(eps)} episodes from {src}")
+    print(
+        f"[raw2lerobot] {args.task}: {len(eps)} episodes from {src}",
+        flush=True,
+    )
 
     (out / "meta").mkdir(parents=True, exist_ok=True)
     (out / "data" / "chunk-000").mkdir(parents=True, exist_ok=True)
@@ -201,7 +277,8 @@ def main():
 
     episodes, stats_rows, instructions = [], [], {}
     running_index = total_frames = 0
-    video_hw = {}
+    source_video_hw = {}
+    video_hw = {cam: (VIDEO_HEIGHT, VIDEO_WIDTH) for cam in CAM_MAP}
 
     for new_idx, h5_path in enumerate(eps):
         raw_idx = int(h5_path.stem.replace("episode", ""))
@@ -242,41 +319,60 @@ def main():
                         f"{h5_path}: {h5cam} has {len(jpegs)} frames, expected {raw_T}"
                     )
                 first = decode_rgb(jpegs[0], f"{h5_path}:{h5cam}:0")
-                H, W = first.shape[:2]
-                previous_hw = video_hw.setdefault(cam, (H, W))
-                if previous_hw != (H, W):
+                source_h, source_w = first.shape[:2]
+                previous_hw = source_video_hw.setdefault(cam, (source_h, source_w))
+                if previous_hw != (source_h, source_w):
                     raise ValueError(
-                        f"{h5_path}: {cam} resolution {(H, W)} differs from {previous_hw}"
+                        f"{h5_path}: {cam} resolution {(source_h, source_w)} differs from {previous_hw}"
                     )
                 vp = out / "videos" / "chunk-000" / cam / f"episode_{new_idx:06d}.mp4"
-                vw = cv2.VideoWriter(str(vp), cv2.VideoWriter_fourcc(*"mp4v"),
-                                     args.fps, (W, H))
-                if not vw.isOpened():
-                    raise RuntimeError(f"OpenCV could not open video writer for {vp}")
                 sampled = []
                 stat_ids = image_stat_indices(T)
-                for i in range(T):
-                    img = first if i == 0 else decode_rgb(
-                        jpegs[i], f"{h5_path}:{h5cam}:{i}"
-                    )
-                    if img.shape[:2] != (H, W):
-                        raise ValueError(
-                            f"{h5_path}:{h5cam}:{i} has resolution {img.shape[:2]}, expected {(H, W)}"
+                def resized_rgb_frames():
+                    for i in range(T):
+                        img = first if i == 0 else decode_rgb(
+                            jpegs[i], f"{h5_path}:{h5cam}:{i}"
                         )
-                    # VideoWriter really does expect BGR. ``img`` is legacy RGB
-                    # (see decode_rgb), so convert exactly at this boundary.
-                    vw.write(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-                    if i in stat_ids:
-                        sampled.append(downsample_stat_image(img))
-                vw.release()
+                        if img.shape[:2] != (source_h, source_w):
+                            raise ValueError(
+                                f"{h5_path}:{h5cam}:{i} has resolution {img.shape[:2]}, "
+                                f"expected {(source_h, source_w)}"
+                            )
+                        # Match RoboTwin's conversion before LeRobot encoding.
+                        # ``img`` is already legacy RGB (see decode_rgb), and
+                        # PyAV receives it explicitly as rgb24: do not BGR-swap.
+                        resized = cv2.resize(img, (VIDEO_WIDTH, VIDEO_HEIGHT))
+                        if i in stat_ids:
+                            sampled.append(downsample_stat_image(resized))
+                        yield resized
+
+                print(
+                    f"  ep{raw_idx:>3} -> {new_idx:06d}  {cam}: "
+                    f"encoding {T} AV1 frames",
+                    flush=True,
+                )
+                encode_av1_video(vp, resized_rgb_frames(), args.fps)
                 if not vp.is_file() or vp.stat().st_size == 0:
-                    raise RuntimeError(f"video writer produced no data at {vp}")
-                check = cv2.VideoCapture(str(vp))
-                written_frames = int(round(check.get(cv2.CAP_PROP_FRAME_COUNT)))
-                check.release()
-                if written_frames != T:
+                    raise RuntimeError(f"AV1 encoder produced no data at {vp}")
+                actual = inspect_video(vp)
+                expected = {
+                    "codec_id": AV1_CODEC_ID,
+                    "pix_fmt": VIDEO_PIX_FMT,
+                    "fps": float(args.fps),
+                    "height": VIDEO_HEIGHT,
+                    "width": VIDEO_WIDTH,
+                    "frames": T,
+                }
+                comparable = {key: actual[key] for key in expected}
+                if comparable != expected:
                     raise RuntimeError(
-                        f"{vp}: video contains {written_frames} frames, expected {T}"
+                        f"{vp}: encoded stream properties {actual}, expected {expected}"
+                    )
+                expected_keyframes = list(range(0, T, 2))
+                if actual["keyframes"] != expected_keyframes:
+                    raise RuntimeError(
+                        f"{vp}: AV1 keyframes do not follow GOP 2; first actual="
+                        f"{actual['keyframes'][:10]}, expected={expected_keyframes[:10]}"
                     )
                 ep_img_stats[cam] = img_stats(sampled)
 
@@ -317,12 +413,12 @@ def main():
 
         running_index += T
         total_frames += T
-        print(f"  ep{raw_idx:>3} -> {new_idx:06d}  frames={T}")
+        print(f"  ep{raw_idx:>3} -> {new_idx:06d}  complete frames={T}", flush=True)
 
     vids = {cam: {
         "dtype": "video", "shape": [3, hw[0], hw[1]], "names": ["channels", "height", "width"],
         "info": {"video.fps": args.fps, "video.height": hw[0], "video.width": hw[1],
-                 "video.channels": 3, "video.codec": "mp4v", "video.pix_fmt": "yuv420p",
+                 "video.channels": 3, "video.codec": "av1", "video.pix_fmt": VIDEO_PIX_FMT,
                  "video.is_depth_map": False, "has_audio": False},
     } for cam, hw in video_hw.items()}
     info = {

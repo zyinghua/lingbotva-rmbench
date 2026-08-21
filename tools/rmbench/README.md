@@ -9,7 +9,8 @@ LingBot-VA post-trains on. Written from three verifiable sources only:
    extraction must mirror (`_encode_obs`, `_get_t5_prompt_embeds`).
 2. **The official released dataset** `robbyant/robotwin-clean-and-aug-lerobot`,
    inspected file by file. Measured ground truth: fps 50, stride 4 sampling
-   (`fps` field = 12), sampled frames truncated to `4k+1`, cam_high 256x320 →
+   (`fps` field = 12), LeRobot videos 480x640 AV1 (libsvtav1, yuv420p,
+   GOP 2, CRF 30), sampled frames truncated to `4k+1`, cam_high 256x320 →
    latent 16x20, wrists 128x160 → 8x10, latents flattened `[N, 48]` bf16,
    `text_emb [512, 4096]` bf16 in every camera file, `empty_emb.pt` at root.
 3. **RMBench raw data** (`TianxingChen/RMBench`): per-episode HDF5 with
@@ -26,6 +27,7 @@ python tools/rmbench/raw_to_lerobot.py \
     --instruction-file RMBench/description/task_instruction/put_back_block.json
 
 # 2. action normalization quantiles (episode-relative poses, canonical 30-dim)
+#    This also writes <dataset>/norm_stat.json.
 python tools/rmbench/compute_norm_stat.py \
     --dataset /datasets/RMBench-data/lingbotva-rmbench/put_back_block
 
@@ -68,13 +70,34 @@ client work with zero code changes.
 - Actions in parquet stay **absolute**; the loader converts to episode-relative
   at read time. norm_stat must be computed on the *relative* values (step 2
   does), never on the raw columns.
+- Preserve the raw quaternion four-vector as `q1,q2,q3,q4`; do not reorder it
+  in isolation. RoboTwin/RMBench stores scalar-first quaternions, while the
+  released LingBot-VA loader and evaluation client consistently apply the same
+  legacy SciPy reinterpretation, so their train/eval transforms cancel. A
+  convention cleanup would require coordinated loader, evaluator and retraining
+  changes rather than a converter-only edit.
 - The LeRobot row alignment follows the released RoboTwin data: row `t` stores
   observation/state from raw frame `t`, but its supervised action is the EEF
   target at raw frame `t+1`. Therefore each exported episode has `raw_T - 1`
   rows and its video omits the final raw frame.
 - RMBench's HDF5 JPEGs preserve simulator RGB numerically despite passing
-  through OpenCV. The converter handles the required RGB->BGR conversion only
-  at the MP4 writer boundary; do not add another channel swap.
-- `deps`: h5py, cv2, pyarrow, scipy — all present in the image after the
+  through OpenCV. The converter treats those arrays as RGB, upscales native
+  240x320 frames to RoboTwin's 480x640 LeRobot storage resolution, and passes
+  them to PyAV as `rgb24`; do not add a channel swap.
+- `deps`: h5py, cv2, pyarrow, scipy, av — all present in the image after the
   documented post-`--no-deps` fix; step 3 additionally needs torch + the
   checkpoint's vae/text_encoder/tokenizer.
+
+## Relationship to the sibling `lingbot-va/tools/rmbench`
+
+That toolset was audited as a reference, not copied wholesale. Its Wan VAE and
+UMT5 math is correct and is retained here, but its exporter starts from another
+qpos LeRobot dataset and takes `action[:T]`; the released RoboTwin alignment
+needed here is direct raw HDF5 conversion with state `[:T-1]` and target action
+`[1:T]`. Its extractor also writes `fps=12.5`, keeps both large encoders resident
+and saves non-atomically. This version keeps the compatible math while pinning
+the released cache field `fps=12`, loading UMT5 and VAE sequentially, validating
+loader action capacity before allocating a model, and writing latent files
+atomically. The normalization implementation is adapted from that toolset with
+metadata-driven episode selection, automatic JSON output, and clipping metrics
+computed only over the 16 channels the loader actually consumes.
