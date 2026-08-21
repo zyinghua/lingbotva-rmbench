@@ -6,7 +6,7 @@ embedding. It does not initialize the transformer or write anything.
 
 Usage:
     python tools/rmbench/validate_dataset.py \
-        --dataset /datasets/lingbot-va-rmbench/put_back_block \
+        --dataset /datasets/RMBench-data/lingbotva-rmbench/put_back_block \
         --expect-episodes 50
 """
 
@@ -72,8 +72,11 @@ def main():
         fail("info.total_tasks disagrees with tasks.jsonl")
 
     action_feature = info.get("features", {}).get("action", {})
+    state_feature = info.get("features", {}).get("observation.state", {})
     if action_feature.get("dtype") != "float32" or action_feature.get("shape") != [16]:
         fail(f"action feature is {action_feature}, expected float32[16]")
+    if state_feature.get("dtype") != "float32" or state_feature.get("shape") != [16]:
+        fail(f"observation.state feature is {state_feature}, expected float32[16]")
     for camera in CAM_KEYS:
         if info.get("features", {}).get(camera, {}).get("dtype") != "video":
             fail(f"missing video feature {camera}")
@@ -94,9 +97,14 @@ def main():
         table = pq.read_table(parquet, columns=["observation.state", "action"])
         if table.num_rows != length:
             fail(f"{parquet}: {table.num_rows} rows, metadata says {length}")
+        state = np.stack(table["observation.state"].to_numpy()).astype(np.float32)
         action = np.stack(table["action"].to_numpy()).astype(np.float32)
+        if state.shape != (length, 16) or not np.isfinite(state).all():
+            fail(f"{parquet}: invalid observation.state shape/values {state.shape}")
         if action.shape != (length, 16) or not np.isfinite(action).all():
             fail(f"{parquet}: invalid action shape/values {action.shape}")
+        if not np.array_equal(action[:-1], state[1:]):
+            fail(f"{parquet}: action[t] is not exactly observation.state[t+1]")
 
         for camera in CAM_KEYS:
             video = root / "videos" / "chunk-000" / camera / f"episode_{episode_index:06d}.mp4"

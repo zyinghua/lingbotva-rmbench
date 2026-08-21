@@ -31,14 +31,15 @@ Camera name mapping (RoboTwin convention, order = va_robotwin_cfg.obs_cam_keys):
 
 As in the released RoboTwin LeRobot data, exported row ``t`` contains the image
 and EEF state from raw frame ``t`` and the action target from raw frame ``t+1``.
-Each raw episode therefore becomes ``raw_length - 1`` rows.
+The RoboTwin-derived RMBench conversion drops the terminal observation and the
+initial action, so each raw episode becomes ``raw_length - 1`` aligned rows.
 
 Usage
 -----
     python tools/rmbench/raw_to_lerobot.py \
         --raw-root /datasets/RMBench-data/data \
         --task put_back_block \
-        --out  /datasets/lingbot-va-rmbench/put_back_block \
+        --out  /datasets/RMBench-data/lingbotva-rmbench/put_back_block \
         --instruction-file RMBench/description/task_instruction/put_back_block.json
 """
 

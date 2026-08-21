@@ -27,7 +27,7 @@ action_per_frame = stride * 4 (va_robotwin_cfg: 16 at stride 4).
 Usage
 -----
     python tools/rmbench/extract_latents.py \
-        --dataset /datasets/lingbot-va-rmbench/put_back_block \
+        --dataset /datasets/RMBench-data/lingbotva-rmbench/put_back_block \
         --model   /workspace/lingbotva-rmbench/ckpts/lingbot-va-base \
         --write-empty-emb
 """

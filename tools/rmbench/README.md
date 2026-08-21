@@ -22,22 +22,22 @@ LingBot-VA post-trains on. Written from three verifiable sources only:
 # 1. raw HDF5 -> LeRobot v2.1 (parquet + per-camera mp4s + meta with action_config)
 python tools/rmbench/raw_to_lerobot.py \
     --raw-root /datasets/RMBench-data/data --task put_back_block \
-    --out /datasets/lingbot-va-rmbench/put_back_block \
+    --out /datasets/RMBench-data/lingbotva-rmbench/put_back_block \
     --instruction-file RMBench/description/task_instruction/put_back_block.json
 
 # 2. action normalization quantiles (episode-relative poses, canonical 30-dim)
 python tools/rmbench/compute_norm_stat.py \
-    --dataset /datasets/lingbot-va-rmbench/put_back_block
+    --dataset /datasets/RMBench-data/lingbotva-rmbench/put_back_block
 
 # 3. VAE latents + text embeddings + empty_emb.pt   (the only GPU step, 1 GPU)
 python tools/rmbench/extract_latents.py \
-    --dataset /datasets/lingbot-va-rmbench/put_back_block \
+    --dataset /datasets/RMBench-data/lingbotva-rmbench/put_back_block \
     --model /workspace/lingbotva-rmbench/ckpts/lingbot-va-base \
     --write-empty-emb
 
 # 4. read-only structural validation before training
 python tools/rmbench/validate_dataset.py \
-    --dataset /datasets/lingbot-va-rmbench/put_back_block \
+    --dataset /datasets/RMBench-data/lingbotva-rmbench/put_back_block \
     --expect-episodes 50
 ```
 

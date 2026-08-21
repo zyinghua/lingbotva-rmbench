@@ -25,7 +25,7 @@ checked instead of trusted.
 
 Usage
 -----
-    python tools/rmbench/compute_norm_stat.py --dataset /datasets/lingbot-va-rmbench/put_back_block
+    python tools/rmbench/compute_norm_stat.py --dataset /datasets/RMBench-data/lingbotva-rmbench/put_back_block
     python tools/rmbench/compute_norm_stat.py --dataset A --dataset B   # joint stats for co-training
 """
 
