@@ -51,8 +51,8 @@ va_rmbench_put_back_block_train_cfg.weight_decay = 0.1
 va_rmbench_put_back_block_train_cfg.warmup_steps = 10
 va_rmbench_put_back_block_train_cfg.batch_size = 1
 va_rmbench_put_back_block_train_cfg.gradient_accumulation_steps = int(
-    os.environ.get("VA_GRAD_ACCUM", "1")
+    os.environ.get("VA_GRAD_ACCUM", "10")
 )
 va_rmbench_put_back_block_train_cfg.num_steps = int(
-    os.environ.get("VA_NUM_STEPS", "3000")
+    os.environ.get("VA_NUM_STEPS", "1500")
 )
