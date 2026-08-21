@@ -1,0 +1,295 @@
+"""Extract Wan2.2 VAE latents + UMT5 text embeddings for an exported RMBench task.
+
+Produces latents/chunk-000/<cam_key>/episode_{idx:06d}_{start}_{end}.pth, the
+format LingBot-VA trains from. Every number below is pinned by two sources:
+
+  * this repo's inference server (wan_va/wan_va_server.py), which this script
+    mirrors operation for operation so train-time latents and deployment-time
+    encoding cannot disagree:
+      - _encode_obs, env_type='robotwin_tshape': cam_high resized to
+        (height, width), both wrists to (height//2, width//2); F.interpolate
+        bilinear align_corners=False on 0-255 floats, THEN /255*2-1; streaming
+        causal VAE encode; mu half of the output; normalized as
+        (mu - latents_mean) / latents_std  (normalize_latents with 1/std).
+      - _get_t5_prompt_embeds: prompt_clean, tokenizer max_length=512, UMT5
+        last_hidden_state, valid rows kept and zero-padded back to 512.
+  * the officially released robotwin dataset (robbyant/robotwin-clean-and-aug-
+    lerobot), whose latent files were inspected directly: recorded at 50 fps,
+    sampled with stride 4 (fps field = 12), sampled count truncated to 4k+1
+    (139 raw -> 35 -> 33 -> 9 latent frames), cam_high 256x320 -> latent 16x20,
+    wrists 128x160 -> 8x10, latent stored flattened [N, 48] bfloat16,
+    text_emb [512, 4096] bfloat16 duplicated into every camera's file.
+
+The 4k+1 truncation makes the causal VAE's output length 1 + (T-1)/4 exact.
+Note action_per_frame in the config is tied to the stride here:
+action_per_frame = stride * 4 (va_robotwin_cfg: 16 at stride 4).
+
+Usage
+-----
+    python tools/rmbench/extract_latents.py \
+        --dataset /datasets/lingbot-va-rmbench/put_back_block \
+        --model   /workspace/lingbotva-rmbench/ckpts/lingbot-va-base \
+        --write-empty-emb
+"""
+
+import argparse
+import gc
+import json
+import os
+import sys
+from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+_REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO / "wan_va"))
+
+from diffusers.pipelines.wan.pipeline_wan import prompt_clean          # noqa: E402
+from modules.utils import (                                            # noqa: E402
+    WanVAEStreamingWrapper, load_text_encoder, load_tokenizer, load_vae)
+
+CAM_KEYS = ["observation.images.cam_high",
+            "observation.images.cam_left_wrist",
+            "observation.images.cam_right_wrist"]
+
+
+def encode_text(tokenizer, text_encoder, text, device):
+    """Mirror of VA_Server._get_t5_prompt_embeds for a single prompt."""
+    prompt = [prompt_clean(text)]
+    ti = tokenizer(prompt, padding="max_length", max_length=512, truncation=True,
+                   add_special_tokens=True, return_attention_mask=True,
+                   return_tensors="pt")
+    ids, mask = ti.input_ids.to(device), ti.attention_mask.to(device)
+    seq_len = int(mask.gt(0).sum())
+    with torch.no_grad():
+        emb = text_encoder(ids, mask).last_hidden_state[0]             # [512, 4096]
+    emb = torch.cat([emb[:seq_len], emb.new_zeros(512 - seq_len, emb.shape[1])])
+    return emb.to(torch.bfloat16).cpu()
+
+
+def read_video_frames(path, frame_ids):
+    cap = cv2.VideoCapture(str(path))
+    frames, want = [], set(frame_ids)
+    idx = 0
+    while True:
+        ok, img = cap.read()
+        if not ok:
+            break
+        if idx in want:
+            frames.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        idx += 1
+    cap.release()
+    if len(frames) != len(frame_ids):
+        raise RuntimeError(f"{path}: read {len(frames)} frames, wanted {len(frame_ids)}")
+    return np.stack(frames)                                            # (T, H, W, 3) uint8
+
+
+@torch.inference_mode()
+def encode_clips(vae, clips, height, width, device, dtype):
+    """Encode a same-length camera batch as 1 frame followed by 4-frame chunks.
+
+    ``AutoencoderKLWan._encode`` uses this exact causal rhythm. Feeding an entire
+    video to a fresh ``WanVAEStreamingWrapper`` in one call is incorrect: the
+    first call primes the temporal-downsampling caches rather than applying all
+    temporal convolutions.
+    """
+    tensors = []
+    expected_frames = None
+    for frames in clips:
+        if expected_frames is None:
+            expected_frames = len(frames)
+        elif len(frames) != expected_frames:
+            raise ValueError("all clips in a VAE batch must have the same length")
+        x = torch.from_numpy(frames).float().permute(3, 0, 1, 2)       # C,T,H,W
+        x = F.interpolate(x, size=(height, width), mode="bilinear",
+                          align_corners=False)
+        tensors.append(x)
+    x = torch.stack(tensors, dim=0) / 255.0 * 2.0 - 1.0               # B,C,T,h,w
+    x = x.to(device=device, dtype=dtype)
+
+    streaming = WanVAEStreamingWrapper(vae)                            # independent causal cache
+    enc_parts = [streaming.encode_chunk(x[:, :, :1])]
+    for start in range(1, x.shape[2], 4):
+        chunk = x[:, :, start:start + 4]
+        if chunk.shape[2] != 4:
+            raise ValueError(
+                f"sampled video must have 4k+1 frames, got {x.shape[2]}"
+            )
+        enc_parts.append(streaming.encode_chunk(chunk))
+    enc = torch.cat(enc_parts, dim=2)
+    mu, _ = torch.chunk(enc, 2, dim=1)
+    mean = torch.tensor(vae.config.latents_mean).view(1, -1, 1, 1, 1).to(mu.device)
+    std = torch.tensor(vae.config.latents_std).view(1, -1, 1, 1, 1).to(mu.device)
+    return ((mu.float() - mean) * (1.0 / std)).to(mu)
+
+
+def save_atomic(payload, path):
+    """Do not leave a truncated .pth that a resumed run would mistake as complete."""
+    temp = path.with_name(path.name + ".tmp")
+    torch.save(payload, temp)
+    os.replace(temp, path)
+
+
+def latent_payload(lat, text_emb, text, frame_ids, start, end, ori_fps, stride,
+                   video_height, video_width):
+    """Build the per-camera payload consumed by LatentLeRobotDataset."""
+    C, Fh, Hh, Wh = lat.shape
+    flat = lat.permute(1, 2, 3, 0).reshape(-1, C).to(torch.bfloat16).cpu()
+    return {
+        "latent": flat,                       # [F*h*w, 48] bf16, f-major
+        "latent_num_frames": Fh,
+        "latent_height": Hh,
+        "latent_width": Wh,
+        "video_num_frames": len(frame_ids),
+        "video_height": video_height,
+        "video_width": video_width,
+        "text_emb": text_emb,                 # [512, 4096] bf16
+        "text": text,
+        "frame_ids": frame_ids,
+        "start_frame": start,
+        "end_frame": end,
+        # The released RoboTwin cache stores the integer field 12 for 50/4.
+        "fps": int(ori_fps / stride),
+        "ori_fps": ori_fps,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dataset", required=True, help="exported LeRobot task root")
+    ap.add_argument("--model", required=True,
+                    help="LingBot-VA checkpoint root holding vae/, text_encoder/, tokenizer/")
+    ap.add_argument("--height", type=int, default=256, help="cam_high target height (va_robotwin_cfg)")
+    ap.add_argument("--width", type=int, default=320, help="cam_high target width")
+    ap.add_argument("--stride", type=int, default=4,
+                    help="frame sampling stride; 4 matches the official dataset (50 -> 12.5 fps) "
+                         "and pins action_per_frame = stride*4 = 16")
+    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--write-empty-emb", action="store_true",
+                    help="also write <dataset>/empty_emb.pt (UMT5 of the empty string, for CFG)")
+    ap.add_argument("--force", action="store_true", help="re-extract existing files")
+    args = ap.parse_args()
+
+    ds = Path(args.dataset)
+    device, dtype = torch.device(args.device), torch.bfloat16
+    if args.stride != 4:
+        raise SystemExit(
+            "this RoboTwin/RMBench config fixes action_per_frame=16, so latent stride must be 4"
+        )
+    if args.height % 16 or args.width % 16:
+        raise SystemExit("--height and --width must both be divisible by the Wan VAE factor 16")
+    info = json.loads((ds / "meta" / "info.json").read_text())
+    ori_fps = info["fps"]
+    episodes = [json.loads(l) for l in open(ds / "meta" / "episodes.jsonl")]
+
+    # Encode every unique prompt once, then release UMT5 before loading the VAE.
+    # This lowers peak VRAM and avoids repeating the same task prompt 50 times.
+    texts = sorted({
+        segment["action_text"]
+        for episode in episodes
+        for segment in episode["action_config"]
+    })
+    print(f"[latents] loading text stack from {args.model} ({len(texts)} unique prompt(s))")
+    tokenizer = load_tokenizer(os.path.join(args.model, "tokenizer"))
+    text_encoder = load_text_encoder(os.path.join(args.model, "text_encoder"),
+                                     torch_dtype=dtype, torch_device=device)
+    text_encoder.eval()
+    text_cache = {
+        text: encode_text(tokenizer, text_encoder, text, device)
+        for text in texts
+    }
+
+    if args.write_empty_emb:
+        torch.save(encode_text(tokenizer, text_encoder, "", device), ds / "empty_emb.pt")
+        print(f"[latents] wrote {ds / 'empty_emb.pt'}")
+
+    del text_encoder, tokenizer
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    print(f"[latents] loading VAE from {args.model}")
+    vae = load_vae(os.path.join(args.model, "vae"), torch_dtype=dtype, torch_device=device)
+    vae.eval()
+
+    for cam in CAM_KEYS:
+        (ds / "latents" / "chunk-000" / cam).mkdir(parents=True, exist_ok=True)
+
+    for ep in episodes:
+        idx, T = ep["episode_index"], ep["length"]
+        for seg in ep["action_config"]:
+            s, e, text = seg["start_frame"], seg["end_frame"], seg["action_text"]
+            frame_ids = list(range(s, e, args.stride))
+            n = len(frame_ids)
+            n = n - ((n - 1) % 4)                                       # largest 4k+1
+            frame_ids = frame_ids[:n]
+            if len(frame_ids) < 5:
+                raise ValueError(
+                    f"episode {idx} [{s},{e}) has only {len(frame_ids)} aligned sampled frames"
+                )
+            latent_T = 1 + (n - 1) // 4
+
+            text_emb = text_cache[text]
+            out_paths = [
+                ds / "latents" / "chunk-000" / cam
+                / f"episode_{idx:06d}_{s}_{e}.pth"
+                for cam in CAM_KEYS
+            ]
+
+            # Head camera: independent full-resolution VAE stream.
+            if args.force or not out_paths[0].exists():
+                head_frames = read_video_frames(
+                    ds / "videos" / "chunk-000" / CAM_KEYS[0]
+                    / f"episode_{idx:06d}.mp4", frame_ids)
+                head_lat = encode_clips(
+                    vae, [head_frames], args.height, args.width, device, dtype
+                )[0]
+                assert head_lat.shape[1] == latent_T, (head_lat.shape[1], latent_T)
+                save_atomic(
+                    latent_payload(
+                        head_lat, text_emb, text, frame_ids, s, e, ori_fps,
+                        args.stride, args.height, args.width,
+                    ),
+                    out_paths[0],
+                )
+
+            # The server encodes left/right wrists together as one half-resolution
+            # batch. Do the same here, then save the two batch items separately.
+            wrist_needed = [args.force or not path.exists() for path in out_paths[1:]]
+            if any(wrist_needed):
+                wrist_frames = [
+                    read_video_frames(
+                        ds / "videos" / "chunk-000" / cam
+                        / f"episode_{idx:06d}.mp4", frame_ids
+                    )
+                    for cam in CAM_KEYS[1:]
+                ]
+                wrist_latents = encode_clips(
+                    vae, wrist_frames, args.height // 2, args.width // 2,
+                    device, dtype,
+                )
+                assert wrist_latents.shape[2] == latent_T, (
+                    wrist_latents.shape[2], latent_T
+                )
+                for wrist_i, needed in enumerate(wrist_needed):
+                    if not needed:
+                        continue
+                    save_atomic(
+                        latent_payload(
+                            wrist_latents[wrist_i], text_emb, text, frame_ids,
+                            s, e, ori_fps, args.stride,
+                            args.height // 2, args.width // 2,
+                        ),
+                        out_paths[wrist_i + 1],
+                    )
+            print(f"  ep{idx:06d} [{s},{e})  sampled={n}  latent_frames={latent_T}")
+
+    print("[latents] done")
+
+
+if __name__ == "__main__":
+    main()
